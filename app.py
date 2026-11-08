@@ -109,59 +109,54 @@ def draw_detections(image_rgb, detections, size_thr):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     return out
 
-def build_hazard_grid(image_shape, detections, resolution, grid_size_m,
-                      size_thr, density_thr, conservative, conf_thr):
+def build_hazard_grid(image_shape, detections, resolution, grid_size_m, size_thr, density_thr, conservative, conf_thr):
     h, w = image_shape[:2]
-    grid_px = max(10, int(round(grid_size_m / resolution)))
+    grid_px = max(10, int(grid_size_m / resolution))
     cols, rows = int(np.ceil(w / grid_px)), int(np.ceil(h / grid_px))
-    hazards_grid = [[[] for _ in range(cols)] for _ in range(rows)]
-    all_grid     = [[[] for _ in range(cols)] for _ in range(rows)]
-
+    grid = [[[] for _ in range(cols)] for _ in range(rows)]
+    grid_all = [[[] for _ in range(cols)] for _ in range(rows)]
+    
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
         cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-        c = min(cols - 1, max(0, cx // grid_px))
-        r = min(rows - 1, max(0, cy // grid_px))
-        all_grid[r][c].append(det)
+        c, r = min(cols - 1, cx // grid_px), min(rows - 1, cy // grid_px)
+        grid_all[r][c].append(det)
         if det["size_m"] >= size_thr:
-            hazards_grid[r][c].append(det)
-
+            grid[r][c].append(det)
+            
     overlay = np.zeros((h, w, 4), dtype=np.uint8)
     grid_info = []
+    
+    # Actual area of a single grid cell in square meters
+    cell_area_m2 = grid_size_m * grid_size_m 
+    
     for r in range(rows):
         for c in range(cols):
-            hazards, all_det = hazards_grid[r][c], all_grid[r][c]
-
+            hazards, all_det = grid[r][c], grid_all[r][c]
+            status, color = "SAFE", (0, 200, 0, 40)
+            
+            # REAL DENSITY MATH
+            actual_density = len(hazards) / cell_area_m2
+            
+            if actual_density >= density_thr:
+                status, color = "UNSAFE", (255, 0, 0, 90)
+            elif len(hazards) > 0:
+                status, color = "CAUTION", (255, 200, 0, 90)
+                
+            if conservative and all_det:
+                if any(d["conf"] < conf_thr + 0.2 or abs(d["size_m"] - size_thr) < 0.15 for d in all_det):
+                    status, color = "REVIEW", (0, 100, 255, 110)
+                    
             y0, y1_ = r * grid_px, min(h, (r + 1) * grid_px)
             x0, x1_ = c * grid_px, min(w, (c + 1) * grid_px)
-            cell_area = max(1e-6, (x1_ - x0) * resolution * (y1_ - y0) * resolution)
-
-            # Base classification
-            density = len(hazards) / cell_area
-            if density >= density_thr:
-                status = "UNSAFE"
-            elif hazards:
-                status = "CAUTION"
-            else:
-                status = "SAFE"
-
-            # Conservative review: can raise CAUTION/SAFE → REVIEW,
-            # but never downgrades UNSAFE.
-            if (conservative and all_det and PRIORITY[status] < PRIORITY["UNSAFE"]):
-                near_size = any(abs(d["size_m"] - size_thr) < 0.15 for d in all_det)
-                low_conf  = any(d["conf"] < conf_thr + 0.2 for d in all_det)
-                if near_size or low_conf:
-                    status = "REVIEW"
-
-            overlay[y0:y1_, x0:x1_] = COLORS[status]
+            overlay[y0:y1_, x0:x1_] = color
             grid_info.append({
-                "cell_id":    f"R{r}C{c}",
-                "status":     status,
-                "n_hazard":   len(hazards),
-                "n_total":    len(all_det),
-                "area_m2":    round(cell_area, 2),
-                "density":    round(density, 3),
-                "max_size_m": round(max((d["size_m"] for d in all_det), default=0.0), 2),
+                "cell_id": f"R{r}C{c}", 
+                "status": status, 
+                "n_hazard": len(hazards),
+                "n_total": len(all_det), 
+                "density": round(actual_density, 3),
+                "max_size_m": max((d["size_m"] for d in all_det), default=0.0)
             })
     return overlay, grid_info
 
