@@ -48,7 +48,7 @@ def build_hazard_grid(image_shape, detections, resolution, grid_size_m, size_thr
     for r in range(rows):
         for c in range(cols):
             hazards, all_det = grid[r][c], grid_all[r][c]
-            status, color = "SAFE", (0, 200, 0, 60)
+            status, color = "SAFE", (0, 200, 0, 0)
             if len(hazards) >= density_thr:
                 status, color = "UNSAFE", (255, 0, 0, 90)
             elif len(hazards) > 0:
