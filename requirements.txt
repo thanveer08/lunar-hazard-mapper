@@ -1,6 +1,8 @@
-streamlit>=1.32.0
-ultralytics>=8.3.0
-opencv-python-headless>=4.9.0
-Pillow>=10.0.0
-numpy>=1.24.0
-pandas>=2.0.0
+# Versions below were tested together (Nov 2026). Pinned so the app does not
+# break when a library changes.
+streamlit==1.67.0
+ultralytics==8.4.208
+opencv-python-headless>=4.9,<6
+Pillow>=10.0
+numpy>=1.24,<3
+pandas>=2.0,<4
