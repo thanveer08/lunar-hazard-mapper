@@ -33,7 +33,7 @@ APP_DIR = Path(__file__).resolve().parent
 # To use a different model, set the BOULDER_MODEL_PATH environment variable.
 MODEL_PATH = os.environ.get("BOULDER_MODEL_PATH", str(APP_DIR / "best.pt"))
 
-ALLOWED_CLASSES = ("boulder", "rock", "stone")
+ALLOWED_CLASSES = ("boulder", "rock", "stone", "hazard", "obstacle", "0", "class0")
 
 # Status levels, lowest to highest. A status can only ever be escalated.
 PRIORITY = {"CLEAR": 0, "CAUTION": 1, "REVIEW": 2, "UNSAFE": 3}
@@ -83,10 +83,12 @@ def _to_uint8(arr):
     if arr.dtype == np.uint8:
         return arr
     a = arr.astype(np.float32)
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     sample = a[::4, ::4] if a.ndim >= 2 and min(a.shape[:2]) > 8 else a
-    lo, hi = np.percentile(sample, (0.5, 99.5))
+    valid_sample = sample[sample > 0] if np.any(sample > 0) else sample
+    lo, hi = np.percentile(valid_sample, (0.5, 99.5))
     if hi <= lo:
-        lo, hi = float(sample.min()), float(sample.max())
+        lo, hi = float(valid_sample.min()), float(valid_sample.max())
     if hi <= lo:
         return np.zeros(arr.shape, np.uint8)
     return ((a - lo) / (hi - lo) * 255.0).clip(0, 255).astype(np.uint8)
@@ -176,16 +178,24 @@ def _predict_batch(model, crops):
         dets = []
         if r.boxes is not None and len(r.boxes):
             names = r.names if getattr(r, "names", None) else {}
-            for box, conf, cls in zip(
+            masks_xy = r.masks.xy if (getattr(r, "masks", None) is not None) else None
+            for idx, (box, conf, cls) in enumerate(zip(
                 r.boxes.xyxy.cpu().numpy(),
                 r.boxes.conf.cpu().numpy(),
                 r.boxes.cls.cpu().numpy(),
-            ):
-                dets.append({
+            )):
+                d_entry = {
                     "bbox": tuple(float(v) for v in box),
                     "conf": float(conf),
                     "class": str(names.get(int(cls), int(cls))),
-                })
+                }
+                if masks_xy is not None and idx < len(masks_xy) and len(masks_xy[idx]) >= 3:
+                    poly = masks_xy[idx]
+                    rect = cv2.minAreaRect(poly.astype(np.float32))
+                    m_size = max(rect[1])
+                    if m_size > 1.0:
+                        d_entry["mask_size_px"] = float(m_size)
+                dets.append(d_entry)
         out.append(dets)
     return out
 
@@ -214,14 +224,23 @@ def detect_pixels(model, image_rgb, use_tiles):
                 if not _class_ok(d["class"]):
                     continue
                 bx1, by1, bx2, by2 = d["bbox"]
-                # Drop boxes cut off by an INNER tile border: the overlapping
-                # neighbour tile sees that boulder whole.
-                if ((bx1 <= EDGE_MARGIN_PX and x0 > 0)
-                        or (bx2 >= tw - EDGE_MARGIN_PX and x0 + tw < w)
-                        or (by1 <= EDGE_MARGIN_PX and y0 > 0)
-                        or (by2 >= th - EDGE_MARGIN_PX and y0 + th < h)):
+                # Only drop tiny boundary sliver artifacts (< 6px).
+                # For legitimate boulders touching an inner border, slightly discount confidence
+                # so the adjacent whole-view tile wins during NMS, but the boulder is NEVER lost.
+                touching_inner = (
+                    (bx1 <= EDGE_MARGIN_PX and x0 > 0)
+                    or (bx2 >= tw - EDGE_MARGIN_PX and x0 + tw < w)
+                    or (by1 <= EDGE_MARGIN_PX and y0 > 0)
+                    or (by2 >= th - EDGE_MARGIN_PX and y0 + th < h)
+                )
+                if touching_inner and (bx2 - bx1 < 6 or by2 - by1 < 6):
                     continue
-                merged.append({**d, "bbox": (bx1 + x0, by1 + y0, bx2 + x0, by2 + y0)})
+                conf = d["conf"] * (0.90 if touching_inner else 1.0)
+                merged.append({
+                    **d,
+                    "conf": conf,
+                    "bbox": (bx1 + x0, by1 + y0, bx2 + x0, by2 + y0),
+                })
 
     keep = nms([d["bbox"] for d in merged], [d["conf"] for d in merged])
     return [merged[i] for i in keep]
@@ -234,13 +253,17 @@ def cached_detect(file_hash, model_id, use_tiles, _model, _image):
 
 
 def to_physical(dets_px, resolution):
-    """Attach sizes in metres. Size = longest side of the bounding box."""
+    """Attach sizes in metres. Prefer mask dimension if available, else bbox longest side."""
     out = []
     for d in dets_px:
         x1, y1, x2, y2 = d["bbox"]
+        bbox_size_px = max(x2 - x1, y2 - y1)
+        size_px = d.get("mask_size_px", bbox_size_px)
+        if size_px <= 0 or not np.isfinite(size_px):
+            size_px = bbox_size_px
         out.append({
             **d,
-            "size_m": max(x2 - x1, y2 - y1) * resolution,
+            "size_m": size_px * resolution,
             "uncertainty_m": UNCERTAINTY_PX * resolution,
         })
     return out
@@ -258,7 +281,7 @@ def effective_grid_px(grid_size_m, resolution):
     return max(MIN_GRID_PX, int(round(grid_size_m / resolution)))
 
 
-def classify_cell(all_det, critical_size, area_m2, p):
+def classify_cell(all_det, critical_size, border_hazard_size, area_m2, p, low_conf_dets=None):
     """Return (status, reasons list, n_hazard, density) for one cell."""
     hazards = [d for d in all_det if d["size_m"] >= p["size_thr"]]
     density = len(hazards) / area_m2
@@ -279,6 +302,11 @@ def classify_cell(all_det, critical_size, area_m2, p):
         reasons.append(
             f"{len(hazards)} hazard-size boulder(s) (≥ {p['size_thr']:.2f} m), density below limit."
         )
+    elif border_hazard_size is not None:
+        status = escalate(status, "CAUTION")
+        reasons.append(
+            f"A hazard boulder of {border_hazard_size:.2f} m (≥ {p['size_thr']:.2f} m) on the border touches this cell."
+        )
 
     if p["conservative"]:
         borderline = [
@@ -286,11 +314,16 @@ def classify_cell(all_det, critical_size, area_m2, p):
             if d["conf"] < p["conf_thr"] + CONF_MARGIN
             or abs(d["size_m"] - p["size_thr"]) <= d["uncertainty_m"]
         ]
-        if borderline:
+        low_candidates = [
+            d for d in (low_conf_dets or [])
+            if d["conf"] < p["conf_thr"]
+        ]
+        all_borderline = borderline + low_candidates
+        if all_borderline:
             # escalate() can raise CLEAR/CAUTION to REVIEW but never lowers UNSAFE.
             status = escalate(status, "REVIEW")
             reasons.append(
-                f"{len(borderline)} detection(s) are borderline (low confidence, or size within "
+                f"{len(all_borderline)} detection(s) are borderline (low confidence < {p['conf_thr'] + CONF_MARGIN:.2f}, or size within "
                 f"measurement error of the {p['size_thr']:.2f} m threshold)."
             )
 
@@ -299,10 +332,10 @@ def classify_cell(all_det, critical_size, area_m2, p):
     return status, reasons, len(hazards), density
 
 
-def build_hazard_grid(image_shape, detections, resolution, grid_size_m, params, scale=1.0):
+def build_hazard_grid(image_shape, detections, resolution, grid_size_m, params, scale=1.0, target_shape=None, all_detections=None):
     """
     Returns (overlay_rgba at display scale, grid_info list, summary dict).
-    Only cells that contain detections (or touch a critical boulder) get entries;
+    Only cells that contain detections (or touch a critical/hazard boulder) get entries;
     every other cell is CLEAR.
     """
     h, w = image_shape[:2]
@@ -312,6 +345,8 @@ def build_hazard_grid(image_shape, detections, resolution, grid_size_m, params, 
 
     cell_dets = {}
     critical_cells = {}
+    border_hazard_cells = {}
+    touching_max_size = {}
 
     def clamp(v, hi):
         return max(0, min(hi, int(v)))
@@ -321,39 +356,76 @@ def build_hazard_grid(image_shape, detections, resolution, grid_size_m, params, 
         r = clamp(((y1 + y2) / 2) // grid_px, rows - 1)
         c = clamp(((x1 + x2) / 2) // grid_px, cols - 1)
         cell_dets.setdefault((r, c), []).append(det)
-        if det["size_m"] >= params["critical_thr"]:
-            # Footprint rule: a big boulder endangers EVERY cell it touches.
-            for rr in range(clamp(y1 // grid_px, rows - 1), clamp(y2 // grid_px, rows - 1) + 1):
-                for cc in range(clamp(x1 // grid_px, cols - 1), clamp(x2 // grid_px, cols - 1) + 1):
-                    critical_cells[(rr, cc)] = max(critical_cells.get((rr, cc), 0.0), det["size_m"])
 
-    hd, wd = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+        # Footprint rule: track every cell this boulder physically touches
+        r_min, r_max = clamp(y1 // grid_px, rows - 1), clamp(y2 // grid_px, rows - 1)
+        c_min, c_max = clamp(x1 // grid_px, cols - 1), clamp(x2 // grid_px, cols - 1)
+        for rr in range(r_min, r_max + 1):
+            for cc in range(c_min, c_max + 1):
+                touching_max_size[(rr, cc)] = max(touching_max_size.get((rr, cc), 0.0), det["size_m"])
+                if det["size_m"] >= params["critical_thr"]:
+                    critical_cells[(rr, cc)] = max(critical_cells.get((rr, cc), 0.0), det["size_m"])
+                elif det["size_m"] >= params["size_thr"] and (rr, cc) != (r, c):
+                    border_hazard_cells[(rr, cc)] = max(border_hazard_cells.get((rr, cc), 0.0), det["size_m"])
+
+    # Index lower-confidence detections for conservative mode
+    cell_low_conf = {}
+    if all_detections and params.get("conservative"):
+        for det in all_detections:
+            if det["conf"] < params["conf_thr"]:
+                x1, y1, x2, y2 = det["bbox"]
+                r = clamp(((y1 + y2) / 2) // grid_px, rows - 1)
+                c = clamp(((x1 + x2) / 2) // grid_px, cols - 1)
+                cell_low_conf.setdefault((r, c), []).append(det)
+
+    if target_shape is not None:
+        hd, wd = target_shape
+    else:
+        hd, wd = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+
     overlay = np.zeros((hd, wd, 4), dtype=np.uint8)
     overlay[:] = STATUS_STYLE["CLEAR"]["rgba"]
 
     grid_info = []
-    for (r, c) in sorted(set(cell_dets) | set(critical_cells)):
+    active_cells = sorted(set(cell_dets) | set(critical_cells) | set(border_hazard_cells) | set(cell_low_conf))
+    for (r, c) in active_cells:
         all_det = cell_dets.get((r, c), [])
+        low_conf = cell_low_conf.get((r, c), [])
         y0, y1 = r * grid_px, min(h, (r + 1) * grid_px)
         x0, x1 = c * grid_px, min(w, (c + 1) * grid_px)
         # True area of this cell (edge cells are partial), with a sane floor.
         area_m2 = max((x1 - x0) * (y1 - y0) * resolution ** 2, MIN_AREA_FRACTION * cell_m ** 2)
 
         status, reasons, n_haz, density = classify_cell(
-            all_det, critical_cells.get((r, c)), area_m2, params
+            all_det, critical_cells.get((r, c)), border_hazard_cells.get((r, c)),
+            area_m2, params, low_conf_dets=low_conf
         )
         overlay[int(round(y0 * scale)):int(round(y1 * scale)),
                 int(round(x0 * scale)):int(round(x1 * scale))] = STATUS_STYLE[status]["rgba"]
+
+        max_s = max(
+            max((d["size_m"] for d in all_det), default=0.0),
+            critical_cells.get((r, c), 0.0),
+            touching_max_size.get((r, c), 0.0),
+        )
         grid_info.append({
             "cell_id": f"R{r}C{c}",
             "status": status,
-            "n_hazard": n_haz,
+            "n_hazard": n_haz + (1 if border_hazard_cells.get((r, c)) else 0),
             "n_total": len(all_det),
             "density": round(density, 4),
-            "max_size_m": round(max((d["size_m"] for d in all_det), default=0.0), 3),
+            "max_size_m": round(max_s, 3),
             "x_px": x0, "y_px": y0,
             "reason": " ".join(reasons),
         })
+
+    # Render clean grid outlines so cell bounds are visually distinct
+    for r in range(rows + 1):
+        y = min(hd - 1, int(round(r * grid_px * scale)))
+        cv2.line(overlay, (0, y), (wd, y), (255, 255, 255, 55), 1)
+    for c in range(cols + 1):
+        x = min(wd - 1, int(round(c * grid_px * scale)))
+        cv2.line(overlay, (x, 0), (x, hd), (255, 255, 255, 55), 1)
 
     counts = {k: 0 for k in PRIORITY}
     for gi in grid_info:
@@ -386,8 +458,10 @@ def draw_detections(disp_rgb, detections, scale, size_thr, critical_thr):
         if label:
             text = f"{size:.2f}m | {det['conf']:.2f}"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(out, text, (x1 + 2, y1 - 4),
+            ty1 = max(0, y1 - th - 6)
+            ty2 = max(th + 6, y1)
+            cv2.rectangle(out, (x1, ty1), (x1 + tw + 4, ty2), color, -1)
+            cv2.putText(out, text, (x1 + 2, ty2 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     return out
 
@@ -507,6 +581,7 @@ except ValueError as e:
 
 dets_px = [d for d in all_px if d["conf"] >= conf_thr]
 detections = to_physical(dets_px, resolution)
+all_physical = to_physical(all_px, resolution)
 
 n_hazards = sum(1 for d in detections if d["size_m"] >= size_thr)
 max_size = max((d["size_m"] for d in detections), default=0.0)
@@ -562,7 +637,8 @@ params = {
     "conservative": conservative, "conf_thr": conf_thr,
 }
 overlay, grid_info, summary = build_hazard_grid(
-    image_rgb.shape, detections, resolution, grid_size_m, params, scale=scale
+    image_rgb.shape, detections, resolution, grid_size_m, params,
+    scale=scale, target_shape=disp.shape[:2], all_detections=all_physical
 )
 hazard_map = composite(disp, overlay)
 st.image(hazard_map, width="stretch")
@@ -588,7 +664,11 @@ st.subheader("🔍 Grid Cell Audit")
 cell_map = {gi["cell_id"]: gi for gi in grid_info}
 if cell_map:
     sorted_ids = sorted(cell_map.keys(), key=cell_sort_key)
-    sel = st.selectbox("Select cell to see reasoning", sorted_ids)
+    def format_cell(cid):
+        info = cell_map[cid]
+        s_emoji = STATUS_STYLE[info["status"]]["emoji"]
+        return f"{cid} — {s_emoji} {info['status']} ({info['n_total']} boulders, {info['n_hazard']} hazard)"
+    sel = st.selectbox("Select cell to see reasoning", sorted_ids, format_func=format_cell)
     gi = cell_map[sel]
     a1, a2, a3, a4 = st.columns(4)
     a1.markdown(f"**Status:** {STATUS_STYLE[gi['status']]['emoji']} {gi['status']}")
@@ -602,6 +682,7 @@ if cell_map:
         "n_total": "All boulders", "density": "Density (/m²)",
         "max_size_m": "Largest (m)", "x_px": "X (px)", "y_px": "Y (px)", "reason": "Reason",
     })
+    st.dataframe(cells_df, width="stretch", hide_index=True)
     st.download_button(
         "⬇️ Download flagged cells (CSV)", cells_df.to_csv(index=False).encode(),
         "hazard_cells.csv", "text/csv",
